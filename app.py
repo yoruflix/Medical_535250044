@@ -115,6 +115,43 @@ def load_hf_dataset_safely(name, n_rows, split_name="train"):
     return ds
 
 
+def _split_patient_doctor_column(df_raw, col_name):
+    """Heuristik: pecah satu kolom teks bebas menjadi question/answer
+    dengan mencari penanda 'patient:'/'doctor:' (atau variasi umum lain).
+    Dipakai saat dataset hanya punya satu kolom teks, apa pun namanya."""
+    questions, answers = [], []
+    for entry in df_raw[col_name].astype(str):
+        q_text, a_text = "", ""
+        lower = entry.lower()
+        patient_idx = lower.find("patient:")
+        doctor_idx = lower.find("doctor:")
+
+        if patient_idx != -1 and doctor_idx != -1:
+            if patient_idx < doctor_idx:
+                q_text = entry[patient_idx + len("patient:"):doctor_idx].strip()
+                a_text = entry[doctor_idx + len("doctor:"):].strip()
+            else:
+                a_text = entry[doctor_idx + len("doctor:"):patient_idx].strip()
+                q_text = entry[patient_idx + len("patient:"):].strip()
+        elif patient_idx != -1:
+            q_text = entry[patient_idx + len("patient:"):].strip()
+        elif doctor_idx != -1:
+            a_text = entry[doctor_idx + len("doctor:"):].strip()
+        else:
+            # tidak ada penanda patient:/doctor: -> gunakan kalimat pertama
+            # sebagai "pertanyaan" dan sisanya (atau teks penuh) sebagai "jawaban"
+            parts = re.split(r"(?<=[.?!])\s+", entry.strip(), maxsplit=1)
+            q_text = parts[0].strip()
+            a_text = parts[1].strip() if len(parts) > 1 else entry.strip()
+
+        questions.append(q_text)
+        answers.append(a_text)
+
+    temp_df = pd.DataFrame({"question": questions, "answer": answers})
+    temp_df = temp_df[(temp_df["question"].str.len() > 5) & (temp_df["answer"].str.len() > 5)]
+    return temp_df
+
+
 def standardize_qa(dataset, question_col=None, answer_col=None, source_name="dataset"):
     df_raw = dataset.to_pandas()
     cols = list(df_raw.columns)
@@ -128,9 +165,10 @@ def standardize_qa(dataset, question_col=None, answer_col=None, source_name="dat
         ("instruction", "output"),
         ("prompt", "completion"),
         ("patient_message", "doctor_response"),
+        ("Description", "Doctor"),
     ]
 
-    if question_col and answer_col:
+    if question_col and answer_col and question_col in cols and answer_col in cols:
         q_col, a_col = question_col, answer_col
     else:
         q_col, a_col = None, None
@@ -140,37 +178,24 @@ def standardize_qa(dataset, question_col=None, answer_col=None, source_name="dat
                 break
 
     if q_col is None or a_col is None:
-        text_cols = [c for c in cols if df_raw[c].dtype == object]
-        if source_name == "medical-chatbot" and len(text_cols) == 1 and text_cols[0] == "text":
-            questions, answers = [], []
-            for entry in df_raw["text"].astype(str):
-                q_text, a_text = "", ""
-                patient_idx = entry.lower().find("patient:")
-                doctor_idx = entry.lower().find("doctor:")
+        # kolom bertipe teks (object) ATAU string biasa (kadang terbaca sebagai
+        # 'string'/'category' tergantung backend parquet)
+        text_cols = [
+            c for c in cols
+            if df_raw[c].dtype == object or pd.api.types.is_string_dtype(df_raw[c])
+        ]
 
-                if patient_idx != -1 and doctor_idx != -1:
-                    if patient_idx < doctor_idx:
-                        q_text = entry[patient_idx + len("patient:"):doctor_idx].strip()
-                        a_text = entry[doctor_idx + len("doctor:"):].strip()
-                    else:
-                        a_text = entry[doctor_idx + len("doctor:"):patient_idx].strip()
-                        q_text = entry[patient_idx + len("patient:"):].strip()
-                elif patient_idx != -1:
-                    q_text = entry[patient_idx + len("patient:"):].strip()
-                elif doctor_idx != -1:
-                    a_text = entry[doctor_idx + len("doctor:"):].strip()
-                else:
-                    q_text = entry.strip()
-
-                questions.append(q_text)
-                answers.append(a_text)
-
-            temp_df = pd.DataFrame({"question": questions, "answer": answers})
-            temp_df = temp_df[(temp_df["question"].str.len() > 5) | (temp_df["answer"].str.len() > 5)]
-
+        if len(text_cols) == 1:
+            # hanya 1 kolom teks -> coba heuristik pecah patient:/doctor:,
+            # berlaku untuk kolom apa pun namanya (bukan cuma 'text')
+            temp_df = _split_patient_doctor_column(df_raw, text_cols[0])
+            if len(temp_df) < 5:
+                raise ValueError(
+                    f"[{source_name}] Kolom teks '{text_cols[0]}' tidak bisa "
+                    f"dipecah menjadi question/answer yang memadai."
+                )
             q_col, a_col = "question", "answer"
             df_raw = temp_df
-            cols = ["question", "answer"]
         elif len(text_cols) >= 2:
             q_col, a_col = text_cols[0], text_cols[1]
         else:
@@ -208,13 +233,46 @@ def detect_category(text):
 
 @st.cache_data(show_spinner="Memuat & memproses dataset medis...")
 def load_and_prepare_dataset():
-    ds1 = load_hf_dataset_safely("ruslanmv/ai-medical-chatbot", SAMPLE_SIZE_PER_DATASET)
-    ds2 = load_hf_dataset_safely("tejas1206/medical-chatbot", SAMPLE_SIZE_PER_DATASET)
+    dataset_sources = [
+        {
+            "name": "ruslanmv/ai-medical-chatbot",
+            "source_name": "ai-medical-chatbot",
+            "question_col": "Patient",
+            "answer_col": "Doctor",
+        },
+        {
+            "name": "tejas1206/medical-chatbot",
+            "source_name": "medical-chatbot",
+            "question_col": None,
+            "answer_col": None,
+        },
+    ]
 
-    df1 = standardize_qa(ds1, question_col="Patient", answer_col="Doctor", source_name="ai-medical-chatbot")
-    df2 = standardize_qa(ds2, source_name="medical-chatbot")
+    frames = []
+    warnings_list = []
 
-    df_combined = pd.concat([df1, df2], ignore_index=True)
+    for spec in dataset_sources:
+        try:
+            ds = load_hf_dataset_safely(spec["name"], SAMPLE_SIZE_PER_DATASET)
+            df_part = standardize_qa(
+                ds,
+                question_col=spec["question_col"],
+                answer_col=spec["answer_col"],
+                source_name=spec["source_name"],
+            )
+            if len(df_part) > 0:
+                frames.append(df_part)
+            else:
+                warnings_list.append(f"Dataset '{spec['name']}' berhasil dimuat tapi tidak menghasilkan baris valid.")
+        except Exception as e:
+            warnings_list.append(f"Dataset '{spec['name']}' dilewati karena gagal diproses: {e}")
+
+    if not frames:
+        raise RuntimeError(
+            "Semua sumber dataset gagal dimuat/diproses. Detail:\n" + "\n".join(warnings_list)
+        )
+
+    df_combined = pd.concat(frames, ignore_index=True)
     df_combined["question"] = df_combined["question"].apply(lambda t: clean_text_field(t, max_len=200))
     df_combined["answer"] = df_combined["answer"].apply(lambda t: clean_text_field(t, max_len=800))
 
@@ -236,7 +294,7 @@ def load_and_prepare_dataset():
     df = df_combined[["category", "question", "answer"]].sample(
         frac=1, random_state=RANDOM_SEED
     ).reset_index(drop=True)
-    return df
+    return df, warnings_list
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +429,7 @@ def build_bot():
     lemmatizer, all_stopwords, sbert_model, use_sbert = setup_nlp()
     preprocess_fn = make_preprocess_fn(lemmatizer, all_stopwords)
 
-    df = load_and_prepare_dataset()
+    df, dataset_warnings = load_and_prepare_dataset()
     df["processed_question"] = df["question"].apply(preprocess_fn)
 
     bot = MedicalChatbotEngineV3(
@@ -382,7 +440,7 @@ def build_bot():
         threshold=0.35,
         top_k=3,
     )
-    return bot, df, use_sbert
+    return bot, df, use_sbert, dataset_warnings
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +458,19 @@ def main():
         icon="⚠️",
     )
 
-    bot, df, use_sbert = build_bot()
+    try:
+        bot, df, use_sbert, dataset_warnings = build_bot()
+    except Exception as e:
+        st.error(
+            "Gagal menyiapkan chatbot karena masalah saat memuat dataset dari "
+            "Hugging Face. Ini biasanya terjadi kalau struktur kolom salah satu "
+            "dataset sumber berubah, atau koneksi ke Hugging Face bermasalah."
+        )
+        st.exception(e)
+        st.stop()
+
+    for w in dataset_warnings:
+        st.sidebar.warning(w, icon="⚠️")
 
     with st.sidebar:
         st.header("ℹ️ Info")
